@@ -34,11 +34,13 @@ struct OPENVINO_GENAI_EXPORTS RawPerfMetrics {
     std::vector<MicroSeconds> detokenization_durations;
 
     std::vector<MicroSeconds> m_times_to_first_token;
+    std::vector<MicroSeconds> m_times_to_second_token;
     std::vector<TimePoint> m_new_token_times;
     std::vector<MicroSeconds> m_token_infer_durations;
     std::vector<size_t> m_batch_sizes;
     std::vector<MicroSeconds> m_durations;
     std::vector<MicroSeconds> m_inference_durations;
+    std::vector<MicroSeconds> m_copy_states_durations;
 };
 
 /**
@@ -100,6 +102,7 @@ struct OPENVINO_GENAI_EXPORTS PerfMetrics {
     float load_time;   // Load time in ms.
     MeanStdPair ttft;  // Time to the first token (in ms) (TTFT).
     MeanStdPair tpot;  // Time (in ms) per output token (TPOT).
+    MeanStdPair tpot_first;  // Time (in ms) per first output token.
     MeanStdPair ipot;  // Inference time (in ms) per output token.
     MeanStdPair throughput;  // Tokens per second.
 
@@ -107,6 +110,7 @@ struct OPENVINO_GENAI_EXPORTS PerfMetrics {
     MeanStdPair inference_duration;
     MeanStdPair tokenization_duration = {-1.0f, -1.0f};
     MeanStdPair detokenization_duration = {-1.0f, -1.0f};
+    MeanStdPair copy_states_duration;
 
     size_t num_generated_tokens;
     size_t num_input_tokens;
@@ -116,6 +120,7 @@ struct OPENVINO_GENAI_EXPORTS PerfMetrics {
     size_t get_num_input_tokens();
     MeanStdPair get_ttft();         // Time to the first token (in ms) (TTFT).
     MeanStdPair get_tpot();         // Time (in ms) per output token (TPOT).
+    MeanStdPair get_tpot_first();   // Time (in ms) per first output token.
     MeanStdPair get_ipot();         // Inference time (in ms) per output token.
     MeanStdPair get_throughput();   // Tokens per second.
 
@@ -123,6 +128,7 @@ struct OPENVINO_GENAI_EXPORTS PerfMetrics {
     MeanStdPair get_generate_duration();        // in ms
     MeanStdPair get_tokenization_duration();    // in ms
     MeanStdPair get_detokenization_duration();  // in ms
+    MeanStdPair get_copy_states_duration();  // in ms
 
     // Flag indicating if raw metrics were evaluated.
     // If false means current mean/std ttft, tpot, etc. are not actual

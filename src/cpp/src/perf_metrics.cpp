@@ -15,12 +15,12 @@ ov::genai::MeanStdPair calc_mean_and_std(const std::vector<ov::genai::MicroSecon
         return {-1, -1};
     }
     // Accepts time durations in microseconds and returns standard deviation and mean in milliseconds.
-    float mean = std::accumulate(durations.begin(), durations.end(), 0.0f, 
+    float mean = std::accumulate(durations.begin(), durations.end(), 0.0f,
         [](const float& acc, const ov::genai::MicroSeconds& duration) -> float {
             return acc + duration.count() / 1000.0f;
         });
     mean /= durations.size();
-    
+
     float sum_square_durations = std::accumulate(durations.begin(), durations.end(), 0.0f,
         [](const float& acc, const ov::genai::MicroSeconds& duration) -> float {
             auto d = duration.count() / 1000.0f;
@@ -54,6 +54,11 @@ MeanStdPair PerfMetrics::get_tpot() {
     return tpot;
 }
 
+MeanStdPair PerfMetrics::get_tpot_first() {
+    evaluate_statistics();
+    return tpot_first;
+}
+
 MeanStdPair PerfMetrics::get_ipot() {
     evaluate_statistics();
     return ipot;
@@ -84,6 +89,11 @@ MeanStdPair PerfMetrics::get_inference_duration() {
     return inference_duration;
 }
 
+MeanStdPair PerfMetrics::get_copy_states_duration() {
+    evaluate_statistics();
+    return copy_states_duration;
+}
+
 float PerfMetrics::get_microsec(std::chrono::steady_clock::duration duration) {
     return std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
 }
@@ -104,9 +114,15 @@ void PerfMetrics::evaluate_statistics(std::optional<TimePoint> start_time) {
         raw_metrics.m_times_to_first_token.emplace_back(ttft);
         num_generated_tokens = batch_sizes[0];
 
+        if (tok_times.size() > 1) {
+            auto tpot_first = tok_times[1] - tok_times[0];
+            raw_metrics.m_times_to_second_token.clear();
+            raw_metrics.m_times_to_second_token.emplace_back(tpot_first);
+        }
+
         // The very first infer request (prefill stage) is slower than subsequent ones since we process a sequence of tokens.
-        // To have a clearer TPOT number, the time taken to generate the very first token at the prefill stage 
-        // must not be included in the TPOT calculation. The first duration used for TPOT is from the first token 
+        // To have a clearer TPOT number, the time taken to generate the very first token at the prefill stage
+        // must not be included in the TPOT calculation. The first duration used for TPOT is from the first token
         // to the second token, not from the start time to the first token.
         for (size_t i = 1; i < tok_times.size(); ++i) {
             // If in 10 ms a batch of 5 new tokens is generated then TPOT is 10 / 5 = 2 tok/ms.
@@ -119,11 +135,13 @@ void PerfMetrics::evaluate_statistics(std::optional<TimePoint> start_time) {
     tpot = calc_mean_and_std(raw_metrics.m_durations);
     ipot = calc_mean_and_std(raw_metrics.m_token_infer_durations);
     ttft = calc_mean_and_std(raw_metrics.m_times_to_first_token);
+    tpot_first = calc_mean_and_std(raw_metrics.m_times_to_second_token);
 
     generate_duration = calc_mean_and_std(raw_metrics.generate_durations);
     tokenization_duration = calc_mean_and_std(raw_metrics.tokenization_durations);
     detokenization_duration = calc_mean_and_std(raw_metrics.detokenization_durations);
     inference_duration = calc_mean_and_std(raw_metrics.m_inference_durations);
+    copy_states_duration = calc_mean_and_std(raw_metrics.m_copy_states_durations);
 
     // tokens per second
     throughput = {1000.0f / tpot.mean, (tpot.std * 1000.0f) / (tpot.mean * tpot.mean)};
@@ -132,7 +150,7 @@ void PerfMetrics::evaluate_statistics(std::optional<TimePoint> start_time) {
 
 PerfMetrics PerfMetrics::operator+(const PerfMetrics& right) const {
     OPENVINO_ASSERT(right.load_time == load_time, "generation metrics can be accumulated only for the same pipeline");
-    
+
     // Copy left value to res.
     PerfMetrics res = *this;
 
@@ -158,13 +176,16 @@ PerfMetrics PerfMetrics::operator+(const PerfMetrics& right) const {
     auto& new_tok_durations = res.raw_metrics.tokenization_durations;
     auto& new_detok_durations = res.raw_metrics.detokenization_durations;
     auto& new_gen_durations = res.raw_metrics.generate_durations;
+    auto& new_copy_states_durations = res.raw_metrics.m_copy_states_durations;
     auto& right_tok_durations = right.raw_metrics.tokenization_durations;
     auto& right_detok_durations = right.raw_metrics.detokenization_durations;
     auto& right_gen_durations = right.raw_metrics.generate_durations;
-    
+    auto& right_copy_states_durations = right.raw_metrics.m_copy_states_durations;
+
     new_tok_durations.insert(new_tok_durations.end(), right_tok_durations.begin(), right_tok_durations.end());
     new_detok_durations.insert(new_detok_durations.end(), right_detok_durations.begin(), right_detok_durations.end());
     new_gen_durations.insert(new_gen_durations.end(), right_gen_durations.begin(), right_gen_durations.end());
+    new_copy_states_durations.insert(new_copy_states_durations.end(), right_copy_states_durations.begin(), right_copy_states_durations.end());
 
     res.num_generated_tokens += right.num_generated_tokens;
     res.num_input_tokens += right.num_input_tokens;

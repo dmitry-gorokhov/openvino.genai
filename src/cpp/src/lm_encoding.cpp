@@ -280,5 +280,235 @@ ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
     return finish_info;
 }
 
+ov::genai::utils::GenerationFinishInfo get_lm_encoded_results(
+    ov::InferRequest& m_llm_prefill,
+    ov::InferRequest& m_llm_generate,
+    const ov::Tensor& input_ids,
+    const ov::Tensor& attention_mask,
+    const std::shared_ptr<StreamerBase>& streamer_ptr,
+    Sampler& sampler,
+    std::vector<SequenceGroup::Ptr> sequence_groups,
+    std::optional<ov::Tensor> position_ids,
+    std::optional<EmbeddingsModel> m_embedding,
+    std::optional<int64_t> rope_delta
+) {
+    std::vector<GenerationHandle> generations;
+    for (SequenceGroup::Ptr sequence_group : sequence_groups) {
+        generations.push_back(std::make_shared<GenerationHandleImpl>(sequence_group->get_generation_stream(), sequence_group->get_sampling_parameters()));
+    }
+
+    auto active_sequence_groups{sequence_groups};
+
+    auto stream_generated_tokens = [&streamer_ptr, &generations, &active_sequence_groups]() {
+        GenerationHandle& handle = generations.at(0);
+        if (streamer_ptr && handle->can_read()) {
+            std::unordered_map<uint64_t, GenerationOutput> generation_outputs = handle->read();
+            OPENVINO_ASSERT(generation_outputs.size() <= 1);
+            if (!generation_outputs.empty()) {
+                for (const auto& generated_token_id : generation_outputs.begin()->second.generated_ids) {
+                    auto streaming_status = streamer_ptr->write(generated_token_id);
+                    if (streaming_status != ov::genai::StreamingStatus::RUNNING) {
+                        streaming_status == ov::genai::StreamingStatus::CANCEL ? handle->cancel() : handle->stop();
+                        break;
+                    }
+                }
+            }
+        }
+    };
+
+    auto free_non_running_requests = [&streamer_ptr, &generations, &active_sequence_groups]() {
+        auto removed_it = std::remove_if(active_sequence_groups.begin(), active_sequence_groups.end(),
+            [](SequenceGroup::Ptr sg) -> bool {
+                return sg->has_finished() || sg->handle_stopped() || sg->handle_cancelled();
+            });
+        active_sequence_groups.erase(removed_it, active_sequence_groups.end());
+    };
+
+    ov::Shape prompts_shape = input_ids.get_shape();
+    const size_t batch_size = prompts_shape[0];
+
+    // Initialize results and performance metrics.
+
+    ov::genai::utils::GenerationFinishInfo finish_info;
+    auto& raw_perf_counters = finish_info.results.perf_metrics.raw_metrics;
+    raw_perf_counters.m_inference_durations = {{ MicroSeconds(0.0f) }};
+
+    // Initialize inputs
+    m_llm_prefill.set_tensor(m_embedding.has_value() ? "inputs_embeds" : "input_ids", input_ids);
+    m_llm_prefill.set_tensor("attention_mask", attention_mask);
+    if (position_ids.has_value())
+        m_llm_prefill.set_tensor("position_ids", *position_ids);
+
+    ov::Tensor beam_idx = ov::Tensor(ov::element::i32, {batch_size});
+    std::fill_n(beam_idx.data<int32_t>(), batch_size, 0);
+    m_llm_prefill.set_tensor("beam_idx", beam_idx);
+
+    // "Prompt" phase
+
+    const auto infer_start = std::chrono::steady_clock::now();
+    m_llm_prefill.infer();
+    const auto infer_end = std::chrono::steady_clock::now();
+    const auto infer_ms = PerfMetrics::get_microsec(infer_end - infer_start);
+    raw_perf_counters.m_inference_durations[0] += MicroSeconds(infer_ms);
+    raw_perf_counters.m_token_infer_durations.emplace_back(infer_ms);
+    raw_perf_counters.m_new_token_times.emplace_back(infer_end);
+    raw_perf_counters.m_batch_sizes.emplace_back(batch_size);
+
+    auto logits = m_llm_prefill.get_tensor("logits");
+
+    int64_t output_sequence_len = logits.get_shape().at(1);
+    for (auto& sequence_group : sequence_groups) {
+        sequence_group->schedule_tokens(sequence_group->get_prompt_len());
+        sequence_group->set_output_seq_len(output_sequence_len);
+    }
+
+    std::map<size_t, size_t> beam_offets;
+    for (size_t i = 0; i < sequence_groups.size(); i++)
+        beam_offets.insert({sequence_groups.at(i)->get_request_id(), i});
+
+    SamplerOutput sampler_output = sampler.sample(sequence_groups, logits);
+    free_non_running_requests(); // handle sampler output
+
+    // "Generation" phase
+
+    const auto copy_states_start = std::chrono::steady_clock::now();
+
+    const auto& prefill_states = m_llm_prefill.query_state();
+    auto generate_states = m_llm_generate.query_state();
+    for (const auto& prefill_state: prefill_states) {
+        bool found = false;
+        for (auto& generate_state: generate_states) {
+            if (prefill_state.get_name() == generate_state.get_name()) {
+                found = true;
+                generate_state.set_state(prefill_state.get_state());
+                break;
+            }
+        }
+
+        if (!found) {
+            throw std::runtime_error("Cannot match states");
+        }
+    }
+
+    const auto copy_states_end = std::chrono::steady_clock::now();
+    const auto copy_states_ms = PerfMetrics::get_microsec(infer_end - infer_start);
+    raw_perf_counters.m_copy_states_durations.emplace_back(copy_states_ms);
+
+    while (!active_sequence_groups.empty()) {
+        size_t total_num_tokens = 0;
+
+        for (auto& sequence_group : active_sequence_groups) {
+            sequence_group->schedule_tokens(1);
+            // compute aggregated values
+            size_t num_sequences = sequence_group->num_running_seqs();
+            total_num_tokens += sequence_group->get_num_scheduled_tokens() * num_sequences;
+        }
+
+        ov::Tensor new_input_ids(ov::element::i64, {total_num_tokens, 1});
+        int64_t * input_ids_data = new_input_ids.data<int64_t>();
+
+        std::vector<int32_t> next_beams;
+        size_t current_batch_size = 0;
+
+        for (auto& sequence_group : active_sequence_groups) {
+            std::vector<Sequence::Ptr> running_sequences = sequence_group->get_running_sequences();
+            size_t num_running_sequences = running_sequences.size();
+            size_t num_scheduled_tokens = sequence_group->get_num_scheduled_tokens();
+            size_t group_position_id = sequence_group->get_num_processed_tokens();
+
+            std::map<size_t, int32_t> beam_idxs = sampler.get_beam_idxs(sequence_group);
+
+            for (size_t seq_id = 0; seq_id < num_running_sequences; ++seq_id) {
+                Sequence::CPtr sequence = running_sequences[seq_id];
+
+                for (size_t token_id = 0, position_id = group_position_id; token_id < num_scheduled_tokens; ++token_id, ++position_id) {
+                    // compute token for current sequence
+                    input_ids_data[token_id] = position_id < sequence_group->get_prompt_len() ?
+                        sequence_group->get_prompt_ids()[position_id] :
+                        sequence->get_generated_ids()[position_id - sequence_group->get_prompt_len()];
+                }
+
+                // apply strides to shift to a next sequence
+                input_ids_data += num_scheduled_tokens;
+
+                // for different sequences iteration of beams started from 0, but we collect it to one input_ids
+                next_beams.push_back(beam_idxs[sequence->get_id()] + beam_offets.at(sequence_group->get_request_id()));
+            }
+
+            current_batch_size += num_running_sequences;
+        }
+
+        for (size_t i = 0; i < active_sequence_groups.size(); i++) {
+            beam_offets[active_sequence_groups.at(i)->get_request_id()] = i == 0 ? 0 : (active_sequence_groups.at(i - 1)->num_running_seqs() + beam_offets[i - 1]);
+        }
+
+        if (m_embedding.has_value()) {
+            const ov::Tensor& embed_prompt_tensor = (*m_embedding).infer(new_input_ids);
+            m_llm_generate.set_tensor("inputs_embeds", embed_prompt_tensor);
+        } else {
+            m_llm_generate.set_tensor("input_ids", new_input_ids);
+        }
+
+        update_attention_mask_with_beams(m_llm_generate.get_tensor("attention_mask"), next_beams);
+
+        if (position_ids.has_value()) {
+            if (position_ids->get_shape().size() == 3 && rope_delta.has_value()) {
+                update_3d_position_ids(m_llm_generate.get_tensor("position_ids"), m_llm_generate.get_tensor("attention_mask"), rope_delta.value());
+            } else {
+                update_position_ids(m_llm_generate.get_tensor("position_ids"), m_llm_generate.get_tensor("attention_mask"));
+            }
+        }
+
+        m_llm_generate.set_tensor("beam_idx", ov::Tensor{ov::element::i32, {total_num_tokens}, next_beams.data()});
+
+        const auto infer_start = std::chrono::steady_clock::now();
+        m_llm_generate.start_async();
+
+        stream_generated_tokens();
+        free_non_running_requests(); // to handle streaming response
+
+        m_llm_generate.wait();
+
+        const auto infer_end = std::chrono::steady_clock::now();
+        const auto infer_ms = PerfMetrics::get_microsec(infer_end - infer_start);
+        raw_perf_counters.m_inference_durations[0] += MicroSeconds(infer_ms);
+        raw_perf_counters.m_token_infer_durations.emplace_back(infer_ms);
+        raw_perf_counters.m_new_token_times.emplace_back(infer_end);
+        raw_perf_counters.m_batch_sizes.emplace_back(current_batch_size);
+
+        sampler_output = sampler.sample(active_sequence_groups, m_llm_generate.get_tensor("logits"));
+        free_non_running_requests(); // handle sampler output
+    }
+
+    stream_generated_tokens();
+    if (streamer_ptr) { // push streamer's cache
+        streamer_ptr->end();
+    }
+
+    for (auto& sequence_group : sequence_groups) {
+        auto sampling_params = sequence_group->get_sampling_parameters();
+        const auto& sequences = sequence_group->get_finished_sequences();
+        size_t num_outputs = std::min(sequence_group->get_sampling_parameters().num_return_sequences, sequences.size());
+        finish_info.streaming_finish_status = sequence_group->get_generation_stream()->get_status();
+
+        for (size_t seq_id = 0; seq_id < num_outputs; ++seq_id) {
+            const auto & sequence = sequences[seq_id];
+            const float score = sampling_params.is_beam_search() ? sequence->get_beam_search_score(sampling_params) : sequence->get_cumulative_log_prob();
+
+            finish_info.results.tokens.push_back(sequence->get_generated_ids());
+            finish_info.results.scores.push_back(score);
+        }
+    }
+
+    for (SequenceGroup::Ptr sequence_group : sequence_groups)
+        sampler.clear_request_info(sequence_group->get_request_id());
+
+    // last generated token is not saved in KV cache, we need to add it for some cases
+    if (sequence_groups[0]->get_finished_sequences()[0]->get_finish_reason() == GenerationFinishReason::LENGTH)
+        finish_info.probably_disappeared_token = finish_info.results.tokens[0].back();
+
+    return finish_info;
+}
+
 }  // namespace genai
 }  // namespace ov
