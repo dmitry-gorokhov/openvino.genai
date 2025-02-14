@@ -43,7 +43,7 @@ HeteroLLMPipeline::HeteroLLMPipeline(
     std::cerr << "Create HeteroLLMPipeline" << std::endl;
 
     std::string prefill_device = device;
-    std::string generate_device = device;
+    std::string generate_device = "CPU";
 
     utils::apply_slice_before_matmul_transformation(model);
     m_kv_history_manager.kv_cache_seq_length_axis = ov::genai::utils::get_seq_len_axis(model);
@@ -58,8 +58,10 @@ HeteroLLMPipeline::HeteroLLMPipeline(
         // m_model_runner_prefill = compiled_model.create_infer_request();
         // m_model_runner_prefill = compiled_model.create_infer_request();
     } else {
-        compiled_model_prefill = utils::singleton_core().compile_model(model, prefill_device, properties);
-        compiled_model_generate = utils::singleton_core().compile_model(model, generate_device, properties);
+        auto compile_properties = properties;
+        compile_properties[ov::hint::kv_cache_precision.name()] = ov::element::f16;
+        compiled_model_prefill = utils::singleton_core().compile_model(model, prefill_device, compile_properties);
+        compiled_model_generate = utils::singleton_core().compile_model(model, generate_device, compile_properties);
         m_model_runner_prefill = compiled_model_prefill.create_infer_request();
         m_model_runner_generate = compiled_model_generate.create_infer_request();
     }

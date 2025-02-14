@@ -197,28 +197,36 @@ ov::genai::LLMPipeline::LLMPipeline(
 
     auto [properties, attention_backend] = extract_attention_backend(user_properties);
 
-//     // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
-//     if (explicitly_requires_paged_attention(properties)) {
-//         auto [device_properties, scheduler_config] = extract_scheduler_config(properties, get_latency_oriented_scheduler_config());
-//         m_pimpl = std::make_unique<ContinuousBatchingAdapter>(models_path, scheduler_config, device, device_properties);
-//     }
+    const bool use_hetero = std::getenv("USE_HETERO_PIPELINE");
 
-//     if (m_pimpl == nullptr && device == "NPU") {
-//         m_pimpl = static_llm::LLMPipelineFactory::create(models_path, device, properties);
-//     }
+    if (!use_hetero) {
+        // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
+        if (explicitly_requires_paged_attention(properties)) {
+            auto [device_properties, scheduler_config] = extract_scheduler_config(properties, get_latency_oriented_scheduler_config());
+            m_pimpl = std::make_unique<ContinuousBatchingAdapter>(models_path, scheduler_config, device, device_properties);
+        }
 
-//     // try to call CB adapter one more time, but with safe guard to silent exception
-//     if (m_pimpl == nullptr && attention_backend == PA_BACKEND) {
-//         try {
-//             // we need use CB only for x86, as for other architectures like arm64 or risc-v we can create Paged Attention based model
-//             // but cannot perform its inference later
-// #ifdef OPENVINO_ARCH_X86_64
-//             m_pimpl = std::make_unique<ContinuousBatchingAdapter>(models_path, get_latency_oriented_scheduler_config(), device, properties);
-// #endif
-//         } catch (ov::Exception&) {
-//             // ignore exceptions from PA
-//         }
-//     }
+        if (m_pimpl == nullptr && device == "NPU") {
+            m_pimpl = static_llm::LLMPipelineFactory::create(models_path, device, properties);
+        }
+
+        // try to call CB adapter one more time, but with safe guard to silent exception
+        if (m_pimpl == nullptr && attention_backend == PA_BACKEND) {
+            try {
+                // we need use CB only for x86, as for other architectures like arm64 or risc-v we can create Paged Attention based model
+                // but cannot perform its inference later
+    #ifdef OPENVINO_ARCH_X86_64
+                m_pimpl = std::make_unique<ContinuousBatchingAdapter>(models_path, get_latency_oriented_scheduler_config(), device, properties);
+    #endif
+            } catch (ov::Exception&) {
+                // ignore exceptions from PA
+            }
+        }
+
+        if (m_pimpl == nullptr) {
+            m_pimpl = std::make_unique<StatefulLLMPipeline>(models_path, device, properties);
+        }
+    }
 
     if (m_pimpl == nullptr) {
         // m_pimpl = std::make_unique<StatefulLLMPipeline>(models_path, device, properties);

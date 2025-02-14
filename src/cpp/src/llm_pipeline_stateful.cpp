@@ -45,10 +45,16 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     if (auto filtered_properties = extract_adapters_from_properties(properties, &m_generation_config.adapters)) {
         m_generation_config.adapters->set_tensor_name_prefix("base_model.model.model.");
         m_adapter_controller = AdapterController(model, *m_generation_config.adapters, device);   // TODO: Make the prefix name configurable
-        compiled_model = utils::singleton_core().compile_model(model, device, *filtered_properties);
+
+        auto compile_properties = *filtered_properties;
+        compile_properties[ov::hint::kv_cache_precision.name()] = ov::element::f16;
+
+        compiled_model = utils::singleton_core().compile_model(model, device, compile_properties);
         m_model_runner = compiled_model.create_infer_request();
     } else {
-        compiled_model = utils::singleton_core().compile_model(model, device, properties);
+        auto compile_properties = properties;
+        compile_properties[ov::hint::kv_cache_precision.name()] = ov::element::f16;
+        compiled_model = utils::singleton_core().compile_model(model, device, compile_properties);
         m_model_runner = compiled_model.create_infer_request();
     }
     ov::genai::utils::print_compiled_model_properties(compiled_model, "Stateful LLM model");
